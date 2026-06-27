@@ -1,13 +1,25 @@
 """Raphael workspaces service."""
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from raphael_contracts.db import ensure_migrations
 from raphael_contracts.errors import ErrorResponse
+from raphael_workspaces.projects import router as projects_router
 from raphael_workspaces.routes import router
 
-app = FastAPI(title="raphael-workspaces", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    ensure_migrations()
+    yield
+
+
+app = FastAPI(title="raphael-workspaces", version="0.1.0", lifespan=lifespan)
 app.include_router(router, prefix="/v1/workspaces")
+app.include_router(projects_router, prefix="/v1/projects")
 
 
 @app.get("/health")

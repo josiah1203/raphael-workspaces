@@ -1,112 +1,181 @@
 import hashlib
 import json
-from typing import List, Optional, Dict, Any
-from raphael_workspaces.vcs.storage import VCSStorage
+from typing import Any
+
 from raphael_workspaces.delta.engine import DeltaEngine
+from raphael_workspaces.vcs.storage import VCSStorage
+
+
+def _op_key(op: dict[str, Any]) -> str:
+    return str(op.get("id") or op.get("name") or op.get("type") or "")
+
 
 class VCService:
     def __init__(self, storage: VCSStorage, delta_engine: DeltaEngine):
         self.storage = storage
         self.delta_engine = delta_engine
 
-    def init_repo(self, repo_id: str, name: str):
-        self.storage.create_repo(repo_id, name)
-        # Create default branch 'main'
-        self.storage.update_ref("main", repo_id, None)
+    def init_repo(self, repo_id: str, name: str, workspace_id: str = "default") -> None:
+        self.storage.create_repo(repo_id, name, workspace_id)
+        self.storage.update_ref("main", repo_id, workspace_id, None)
 
-    def create_commit(self, repo_id: str, branch: str, message: str, 
-                      author: str, events: List[Dict[str, Any]], 
-                      wal_start: int, wal_end: int) -> str:
-        
-        parent_hash = self.storage.get_ref(branch, repo_id)
-        
-        # Squash events
+    def create_commit(
+        self,
+        repo_id: str,
+        workspace_id: str,
+        branch: str,
+        message: str,
+        author: str,
+        events: list[dict[str, Any]],
+        wal_start: int,
+        wal_end: int,
+        intent_summary: str | None = None,
+    ) -> str:
+        parent_hash = self.storage.get_ref(branch, repo_id, workspace_id)
         ops = self.delta_engine.squash_events(events)
         ops_json = json.dumps(ops)
-        
-        # Calculate commit hash
-        content = f"{parent_hash or ''}{repo_id}{branch}{author}{message}{ops_json}{wal_start}{wal_end}"
+        content = f"{parent_hash or ''}{repo_id}{workspace_id}{branch}{author}{message}{ops_json}{wal_start}{wal_end}"
         commit_hash = hashlib.sha256(content.encode()).hexdigest()
-        
-        self.storage.add_commit(commit_hash, repo_id, parent_hash, author, message, ops_json, wal_start, wal_end)
-        self.storage.update_ref(branch, repo_id, commit_hash)
-        
+        self.storage.add_commit(
+            commit_hash, repo_id, workspace_id, parent_hash, author, message, ops_json, wal_start, wal_end, intent_summary
+        )
+        self.storage.update_ref(branch, repo_id, workspace_id, commit_hash)
         return commit_hash
 
-    def get_log(self, repo_id: str, branch: Optional[str] = None) -> List[Dict[str, Any]]:
-        # For now, just return all commits for the repo
-        return self.storage.get_commits(repo_id)
+    def _commit_map(self, repo_id: str, workspace_id: str) -> dict[str, dict[str, Any]]:
+        return {c["hash"]: c for c in self.storage.get_commits(repo_id, workspace_id)}
 
-    def create_branch(self, repo_id: str, new_branch: str, from_branch: str):
-        if not self.storage.ref_exists(from_branch, repo_id):
+    def _ancestors(self, commit_hash: str | None, repo_id: str, workspace_id: str) -> set[str]:
+        commits = self._commit_map(repo_id, workspace_id)
+        seen: set[str] = set()
+        cur = commit_hash
+        while cur and cur not in seen:
+            seen.add(cur)
+            cur = commits.get(cur, {}).get("parent_hash")
+        return seen
+
+    def _common_ancestor(self, a: str | None, b: str | None, repo_id: str, workspace_id: str) -> str | None:
+        if not a or not b:
+            return None
+        if a == b:
+            return a
+        ancestors_b = self._ancestors(b, repo_id, workspace_id)
+        cur = a
+        commits = self._commit_map(repo_id, workspace_id)
+        while cur:
+            if cur in ancestors_b:
+                return cur
+            cur = commits.get(cur, {}).get("parent_hash")
+        return None
+
+    def get_log(self, repo_id: str, workspace_id: str = "default", branch: str | None = None) -> list[dict[str, Any]]:
+        commits = self._commit_map(repo_id, workspace_id)
+        if not branch:
+            return list(commits.values())
+        tip = self.storage.get_ref(branch, repo_id, workspace_id)
+        if not tip:
+            return []
+        log: list[dict[str, Any]] = []
+        cur = tip
+        seen: set[str] = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            if cur in commits:
+                log.append(commits[cur])
+            cur = commits[cur].get("parent_hash") if cur in commits else None
+        return log
+
+    def create_branch(self, repo_id: str, workspace_id: str, new_branch: str, from_branch: str) -> None:
+        if not self.storage.ref_exists(from_branch, repo_id, workspace_id):
             raise ValueError(f"Source branch {from_branch} not found")
-        commit_hash = self.storage.get_ref(from_branch, repo_id)
-        self.storage.update_ref(new_branch, repo_id, commit_hash)
+        commit_hash = self.storage.get_ref(from_branch, repo_id, workspace_id)
+        self.storage.update_ref(new_branch, repo_id, workspace_id, commit_hash)
 
-    def create_tag(self, repo_id: str, tag_name: str, branch: str):
-        if not self.storage.ref_exists(branch, repo_id):
+    def create_tag(self, repo_id: str, workspace_id: str, tag_name: str, branch: str) -> None:
+        if not self.storage.ref_exists(branch, repo_id, workspace_id):
             raise ValueError(f"Branch {branch} not found")
-        commit_hash = self.storage.get_ref(branch, repo_id)
+        commit_hash = self.storage.get_ref(branch, repo_id, workspace_id)
         if not commit_hash:
             raise ValueError(f"Cannot tag empty branch {branch}")
-        self.storage.add_tag(tag_name, repo_id, commit_hash)
+        self.storage.add_tag(tag_name, repo_id, workspace_id, commit_hash)
 
-    def merge(self, repo_id: str, source_branch: str, target_branch: str, author: str) -> Dict[str, Any]:
-        if not self.storage.ref_exists(source_branch, repo_id) or not self.storage.ref_exists(target_branch, repo_id):
+    def merge(self, repo_id: str, workspace_id: str, source_branch: str, target_branch: str, author: str) -> dict[str, Any]:
+        if not self.storage.ref_exists(source_branch, repo_id, workspace_id) or not self.storage.ref_exists(
+            target_branch, repo_id, workspace_id
+        ):
             raise ValueError("Both source and target branches must exist")
-            
-        source_hash = self.storage.get_ref(source_branch, repo_id)
-        target_hash = self.storage.get_ref(target_branch, repo_id)
-        
+
+        source_hash = self.storage.get_ref(source_branch, repo_id, workspace_id)
+        target_hash = self.storage.get_ref(target_branch, repo_id, workspace_id)
+
         if source_hash == target_hash:
             return {"status": "up-to-date", "hash": target_hash}
-            
         if not source_hash:
             return {"status": "up-to-date", "hash": target_hash}
-            
         if not target_hash:
-            # Fast-forward
-            self.storage.update_ref(target_branch, repo_id, source_hash)
+            self.storage.update_ref(target_branch, repo_id, workspace_id, source_hash)
             return {"status": "merged", "hash": source_hash}
-            
-        # Get source commits since they diverged (simple version: just get all and compare)
-        # For now, let's just take the last commit from source and its ops
-        # In a real VCS we'd find the common ancestor.
-        
-        source_commits = self.storage.get_commits(repo_id)
-        target_commits = source_commits # same table
-        
-        source_commit = next(c for c in source_commits if c["hash"] == source_hash)
-        target_commit = next(c for c in target_commits if c["hash"] == target_hash)
-        
-        source_ops = json.loads(source_commit["ops"])
-        target_ops = json.loads(target_commit["ops"])
-        
-        # Conflict detection: same component moved or same parameter updated
+
+        base = self._common_ancestor(source_hash, target_hash, repo_id, workspace_id)
+        commits = self._commit_map(repo_id, workspace_id)
+
+        def ops_since(base_hash: str | None, tip: str) -> list[dict[str, Any]]:
+            ops: list[dict[str, Any]] = []
+            cur = tip
+            while cur and cur != base_hash:
+                c = commits.get(cur)
+                if not c:
+                    break
+                ops = json.loads(c["ops"]) + ops
+                cur = c.get("parent_hash")
+            return ops
+
+        source_ops = ops_since(base, source_hash)
+        target_ops = ops_since(base, target_hash)
+
         conflicts = []
-        source_ids = {op.get("id") or op.get("name") for op in source_ops if op.get("id") or op.get("name")}
-        target_ids = {op.get("id") or op.get("name") for op in target_ops if op.get("id") or op.get("name")}
-        
-        intersection = source_ids.intersection(target_ids)
-        if intersection:
-            for item_id in intersection:
-                # Check if values are actually different
-                s_op = next(op for op in source_ops if (op.get("id") or op.get("name")) == item_id)
-                t_op = next(op for op in target_ops if (op.get("id") or op.get("name")) == item_id)
-                if s_op != t_op:
-                    conflicts.append({"id": item_id, "source": s_op, "target": t_op})
-        
+        target_by_key = {_op_key(op): op for op in target_ops if _op_key(op)}
+        for sop in source_ops:
+            key = _op_key(sop)
+            if not key:
+                continue
+            top = target_by_key.get(key)
+            if top and top != sop:
+                conflicts.append({"id": key, "source": sop, "target": top})
+
         if conflicts:
             return {"status": "conflict", "conflicts": conflicts}
-            
-        # No conflicts, create merge commit
-        merged_ops = target_ops + [op for op in source_ops if (op.get("id") or op.get("name")) not in target_ids]
-        
-        content = f"{target_hash}{source_hash}{repo_id}merge{author}{json.dumps(merged_ops)}"
+
+        merged_ops = target_ops + [op for op in source_ops if _op_key(op) not in target_by_key]
+        ops_json = json.dumps(merged_ops)
+        content = f"{target_hash}{source_hash}{repo_id}{workspace_id}merge{author}{ops_json}"
         merge_hash = hashlib.sha256(content.encode()).hexdigest()
-        
-        self.storage.add_commit(merge_hash, repo_id, target_hash, author, 
-                               f"Merge branch {source_branch}", json.dumps(merged_ops), 0, 0)
-        self.storage.update_ref(target_branch, repo_id, merge_hash)
-        
+        self.storage.add_commit(
+            merge_hash,
+            repo_id,
+            workspace_id,
+            target_hash,
+            author,
+            f"Merge branch {source_branch}",
+            ops_json,
+            0,
+            0,
+        )
+        self.storage.update_ref(target_branch, repo_id, workspace_id, merge_hash)
         return {"status": "merged", "hash": merge_hash}
+
+    def fork_repo(self, repo_id: str, workspace_id: str, new_id: str, name: str) -> dict[str, Any]:
+        self.storage.copy_repo(repo_id, new_id, workspace_id, name, parent_module_id=repo_id)
+        return self.storage.get_repo(new_id, workspace_id) or {"id": new_id, "name": name}
+
+    def slice_repo(
+        self,
+        repo_id: str,
+        workspace_id: str,
+        new_id: str,
+        name: str,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        attribution = json.dumps({"scope": scope or "full", "source": repo_id})
+        self.storage.copy_repo(repo_id, new_id, workspace_id, name, parent_module_id=repo_id, slice_attribution=attribution)
+        return self.storage.get_repo(new_id, workspace_id) or {"id": new_id, "name": name}

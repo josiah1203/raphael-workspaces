@@ -8,6 +8,8 @@ dependencies = [
     "uvicorn>=0.27",
     "httpx>=0.27",
     "raphael-contracts>=0.1.0",
+    "raphael-artifacts>=0.1.0",
+    "kafka-python>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ packages = ["src/raphael_workspaces"]
 
 [tool.uv.sources]
 raphael-contracts = { path = "../raphael-contracts", editable = true }
+raphael-artifacts = { path = "../raphael-artifacts", editable = true }
 
 [tool.ruff]
 line-length = 100
