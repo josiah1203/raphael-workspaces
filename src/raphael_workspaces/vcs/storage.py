@@ -237,7 +237,10 @@ class VCSStorage:
     ) -> None:
         ops_value: Any = ops
         if self._postgres:
-            ops_value = json.loads(ops) if isinstance(ops, str) else ops
+            from psycopg.types.json import Json
+
+            parsed = json.loads(ops) if isinstance(ops, str) else ops
+            ops_value = Json(parsed)
         self._execute(
             """
             INSERT INTO commits (hash, repo_id, workspace_id, parent_hash, author, message, ops, wal_range_start, wal_range_end, intent_summary)
